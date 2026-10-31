@@ -5,7 +5,6 @@
 #pragma once
 
 //System Includes
-#include <atomic>
 #include <set>
 #include <map>
 #include <chrono>
@@ -18,12 +17,11 @@
 #include <system_error>
 
 //Project Includes
-#include "corvusoft/restbed/logger.hpp"
 
 //External Includes
 #include <asio/ip/tcp.hpp>
 #include <asio/signal_set.hpp>
-#include <asio/io_context.hpp>
+#include <asio/io_service.hpp>
 
 #ifdef BUILD_SSL
     #include <asio/ssl.hpp>
@@ -43,16 +41,17 @@ namespace restbed
 {
     //Forward Declarations
     class Uri;
-    class Request;
+    class Rule;
+    class Logger;
     class Session;
     class Resource;
     class Settings;
+    class SessionManager;
     class SSLSettings;
     
     namespace detail
     {
         //Forward Declarations
-        class SocketImpl;
         class WebSocketManagerImpl;
         
         class ServiceImpl
@@ -78,14 +77,18 @@ namespace restbed
                 
                 void create_ssl_session( const std::shared_ptr< asio::ssl::stream< asio::ip::tcp::socket > >& socket, const std::error_code& error ) const;
 #endif
-                
+
 #ifdef BUILD_IPC
                 void ipc_start( void );
-                
+
                 void ipc_listen( void ) const;
-                
+
                 void create_ipc_session( const std::shared_ptr< asio::local::stream_protocol::socket >& socket, const std::error_code& error ) const;
 #endif
+
+                void setup_signal_handler( void );
+                
+                void signal_handler( const std::error_code& error, const int signal_number ) const;
                 
                 std::string sanitise_path( const std::string& path ) const;
                 
@@ -99,11 +102,11 @@ namespace restbed
                 
                 void method_not_implemented( const std::shared_ptr< Session > session ) const;
                 
+                void failed_filter_validation( const std::shared_ptr< Session > session ) const;
+                
                 void router( const std::shared_ptr< Session > session ) const;
                 
                 void create_session( const std::shared_ptr< asio::ip::tcp::socket >& socket, const std::error_code& error ) const;
-                
-                void start_session( const std::shared_ptr< SocketImpl >& connection ) const;
                 
                 void extract_path_parameters( const std::string& sanitised_path, const std::shared_ptr< const Request >& request ) const;
                 
@@ -121,8 +124,6 @@ namespace restbed
                 
                 static const std::multimap< std::string, std::string > parse_request_headers( std::istream& stream );
                 
-                static double parse_http_version( const std::string& value );
-                
                 void parse_request( const std::error_code& error, std::size_t length, const std::shared_ptr< Session > session ) const;
                 
                 //Getters
@@ -137,7 +138,7 @@ namespace restbed
                 //Operators
                 
                 //Properties
-                std::atomic<std::chrono::steady_clock::time_point> m_uptime;
+                std::chrono::steady_clock::time_point m_uptime;
                 
                 std::shared_ptr< Logger > m_logger;
                 
@@ -145,11 +146,15 @@ namespace restbed
                 
                 std::shared_ptr< const Settings > m_settings;
                 
-                std::shared_ptr< asio::io_context > m_io_context;
+                std::shared_ptr< asio::io_service > m_io_service;
                 
                 std::shared_ptr< asio::signal_set > m_signal_set;
                 
+                std::shared_ptr< SessionManager > m_session_manager;
+                
                 std::shared_ptr< WebSocketManagerImpl > m_web_socket_manager;
+                
+                std::vector< std::shared_ptr< Rule > > m_rules;
                 
                 std::unique_ptr< std::future<void > > m_workers_stopped;
 #ifdef BUILD_SSL
@@ -159,7 +164,7 @@ namespace restbed
                 
                 std::shared_ptr< asio::ip::tcp::acceptor > m_ssl_acceptor;
 #endif
-                
+
 #ifdef BUILD_IPC
                 std::shared_ptr< asio::local::stream_protocol::acceptor > m_ipc_acceptor;
 #endif
@@ -171,14 +176,20 @@ namespace restbed
                 
                 std::function< void ( void ) > m_ready_handler;
                 
+                std::map< int, std::function< void ( const int ) > > m_signal_handlers;
+                
                 std::function< void ( const std::shared_ptr< Session > ) > m_not_found_handler;
                 
                 std::function< void ( const std::shared_ptr< Session > ) > m_method_not_allowed_handler;
                 
                 std::function< void ( const std::shared_ptr< Session > ) > m_method_not_implemented_handler;
                 
+                std::function< void ( const std::shared_ptr< Session > ) > m_failed_filter_validation_handler;
+                
                 std::function< void ( const int, const std::exception&, const std::shared_ptr< Session > ) > m_error_handler;
                 
+                std::function< void ( const std::shared_ptr< Session >, int statusCode ) > m_perf_handler;
+
                 std::function< void ( const std::shared_ptr< Session >, const std::function< void ( const std::shared_ptr< Session > ) >& ) > m_authentication_handler;
                 
             protected:

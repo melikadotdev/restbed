@@ -5,18 +5,18 @@
 //System Includes
 #include <regex>
 #include <cstdio>
-#include <format>
 #include <sstream>
 #include <utility>
 #include <ciso646>
-#include <charconv>
+#include <cstdlib>
+#include <clocale>
 #include <stdexcept>
 #include <algorithm>
 #include <functional>
-#include <system_error>
 
 //Project Includes
 #include "corvusoft/restbed/uri.hpp"
+#include "corvusoft/restbed/rule.hpp"          ## Fork addition: rule engine support
 #include "corvusoft/restbed/logger.hpp"
 #include "corvusoft/restbed/string.hpp"
 #include "corvusoft/restbed/request.hpp"
@@ -25,11 +25,14 @@
 #include "corvusoft/restbed/settings.hpp"
 #include "corvusoft/restbed/status_code.hpp"
 #include "corvusoft/restbed/ssl_settings.hpp"
+#include "corvusoft/restbed/session_manager.hpp"   ## Fork addition: external session lifecycle management
 #include "corvusoft/restbed/detail/socket_impl.hpp"
 #include "corvusoft/restbed/detail/request_impl.hpp"
 #include "corvusoft/restbed/detail/service_impl.hpp"
 #include "corvusoft/restbed/detail/session_impl.hpp"
 #include "corvusoft/restbed/detail/resource_impl.hpp"
+#include "corvusoft/restbed/detail/ipc_socket_impl.hpp"    ## Fork addition: dedicated IPC socket class (upstream unifies under SocketImpl)
+#include "corvusoft/restbed/detail/rule_engine_impl.hpp"   ## Fork addition: rule engine implementation
 #include "corvusoft/restbed/detail/web_socket_manager_impl.hpp"
 
 //External Includes
@@ -37,14 +40,15 @@
 //System Namespaces
 using std::set;
 using std::map;
+using std::free;       ## Needed for the setlocale/stod locale hack (see parse_request)
 using std::pair;
 using std::bind;
 using std::regex;
 using std::string;
-using std::smatch;
 using std::istream;
 using std::find_if;
 using std::function;
+using std::setlocale;  ## Needed for the stod locale hack — thread-unsafe global state mutation
 using std::multimap;
 using std::to_string;
 using std::exception;
@@ -65,8 +69,9 @@ using std::regex_constants::icase;
 
 //External Namespaces
 using asio::ip::tcp;
-using asio::io_context;
+using asio::io_service;    ## Deprecated ASIO API — upstream uses io_context
 using asio::signal_set;
+using asio::ip::address;   ## Upstream dropped this using-decl; uses asio::ip::make_address() directly
 using asio::socket_base;
 using asio::system_error;
 
@@ -82,9 +87,11 @@ namespace restbed
             m_logger( nullptr ),
             m_supported_methods( ),
             m_settings( nullptr ),
-            m_io_context( make_shared< ::io_context >( ) ),
+            m_io_service( make_shared< ::io_service >( ) ),   ## Deprecated: upstream uses io_context
             m_signal_set( nullptr ),
+            m_session_manager( nullptr ),       ## Fork addition: pluggable session lifecycle (persistence, pooling, custom IDs)
             m_web_socket_manager( nullptr ),
+            m_rules( ),                         ## Fork addition: service-level middleware rules
             m_workers_stopped( ),
 #ifdef BUILD_SSL
             m_ssl_settings( nullptr ),
@@ -98,57 +105,97 @@ namespace restbed
             m_resource_paths( ),
             m_resource_routes( ),
             m_ready_handler( nullptr ),
+            m_signal_handlers( ),               ## Fork addition: map of signal number → handler for in-process signal management
             m_not_found_handler( nullptr ),
             m_method_not_allowed_handler( nullptr ),
             m_method_not_implemented_handler( nullptr ),
+            m_failed_filter_validation_handler( nullptr ),  ## Fork addition: called when header filters reject all method handlers
             m_error_handler( ServiceImpl::default_error_handler ),
+            m_perf_handler( nullptr ),          ## Fork addition: request-level performance/timing callback
             m_authentication_handler( nullptr )
         {
             return;
         }
-        
+
         ServiceImpl::~ServiceImpl( void )
         {
             return;
         }
-        
+
         void ServiceImpl::http_start( void )
         {
 #ifdef BUILD_SSL
-        
+
             if ( m_ssl_settings == nullptr or m_ssl_settings->has_disabled_http( ) == false )
             {
 #endif
-            
+
                 if ( not m_settings->get_bind_address( ).empty( ) )
                 {
-                    const auto address = asio::ip::make_address( m_settings->get_bind_address( ) );
-                    m_acceptor = make_shared< tcp::acceptor >( *m_io_context, tcp::endpoint( address, m_settings->get_port( ) ) );
+                    const auto address = address::from_string( m_settings->get_bind_address( ) );  ## Deprecated: upstream uses asio::ip::make_address()
+                    m_acceptor = make_shared< tcp::acceptor >( *m_io_service, tcp::endpoint( address, m_settings->get_port( ) ) );
                 }
                 else
                 {
-                    m_acceptor = make_shared< tcp::acceptor >( *m_io_context, tcp::endpoint( tcp::v6( ), m_settings->get_port( ) ) );
+                    m_acceptor = make_shared< tcp::acceptor >( *m_io_service, tcp::endpoint( tcp::v6( ), m_settings->get_port( ) ) );
                 }
-                
+
                 m_acceptor->set_option( socket_base::reuse_address( m_settings->get_reuse_address( ) ) );
                 m_acceptor->listen( m_settings->get_connection_limit( ) );
-                
+
                 http_listen( );
-                
+
                 const auto location = get_http_uri( )->to_string( );
-                log( Logger::INFO, std::format( "Service accepting HTTP connections at '{}'.",  location ) );
+                log( Logger::INFO, String::format( "Service accepting HTTP connections at '%s'.",  location.data( ) ) );  ## Custom String::format (sprintf wrapper) — upstream uses std::format (C++20, type-safe)
 #ifdef BUILD_SSL
             }
-            
+
 #endif
         }
-        
+
         void ServiceImpl::http_listen( void ) const
         {
-            auto socket = make_shared< tcp::socket >( *m_io_context );
+            auto socket = make_shared< tcp::socket >( *m_io_service );
             m_acceptor->async_accept( *socket, bind( &ServiceImpl::create_session, this, socket, _1 ) );
         }
-        
+
+        ## Fork addition: signal handling — upstream removed this entirely
+        ## Registers OS signal handlers (SIGTERM, SIGHUP, etc.) through ASIO's signal_set
+        ## for async dispatch. Enables graceful shutdown / config reload from the framework API.
+        void ServiceImpl::setup_signal_handler( void )
+        {
+            if ( m_signal_handlers.empty( ) )
+            {
+                return;
+            }
+
+            m_signal_set = make_shared< signal_set >( *m_io_service );
+
+            for ( const auto& signal_handler : m_signal_handlers )
+            {
+                m_signal_set->add( signal_handler.first );
+            }
+
+            m_signal_set->async_wait( bind( &ServiceImpl::signal_handler, this, _1, _2 ) );
+        }
+
+        ## Fork addition: async signal dispatch — re-registers itself after each signal
+        void ServiceImpl::signal_handler( const error_code& error, const int signal_number ) const
+        {
+            if ( error )
+            {
+                log( Logger::WARNING, String::format( "Failed to process signal '%i', '%s'.", signal_number, error.message( ).data( ) ) );
+                return;
+            }
+
+            if ( m_signal_handlers.count( signal_number ) )
+            {
+                m_signal_handlers.at( signal_number )( signal_number );
+            }
+
+            m_signal_set->async_wait( bind( &ServiceImpl::signal_handler, this, _1, _2 ) );
+        }
+
 #ifdef BUILD_SSL
         void ServiceImpl::https_start( void )
         {
@@ -156,55 +203,55 @@ namespace restbed
             {
                 m_ssl_context = make_shared< asio::ssl::context >( asio::ssl::context::sslv23 );
                 m_ssl_context->set_default_verify_paths( );
-                
+
                 auto passphrase = m_ssl_settings->get_passphrase( );
                 m_ssl_context->set_password_callback( [ passphrase ]( size_t, asio::ssl::context::password_purpose )
                 {
                     return passphrase;
                 } );
-                
+
                 auto filename = m_ssl_settings->get_temporary_diffie_hellman( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->use_tmp_dh_file( filename );
                 }
-                
+
                 filename = m_ssl_settings->get_certificate_authority_pool( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->add_verify_path( filename );
                 }
-                
+
                 filename = m_ssl_settings->get_certificate_chain( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->use_certificate_chain_file( filename );
                 }
-                
+
                 filename = m_ssl_settings->get_certificate( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->use_certificate_file( filename, asio::ssl::context::pem );
                 }
-                
+
                 filename = m_ssl_settings->get_private_key( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->use_private_key_file( filename, asio::ssl::context::pem );
                 }
-                
+
                 filename = m_ssl_settings->get_private_rsa_key( );
-                
+
                 if ( not filename.empty( ) )
                 {
                     m_ssl_context->use_rsa_private_key_file( filename, asio::ssl::context::pem );
                 }
-                
+
                 asio::ssl::context::options options = 0;
                 options = ( m_ssl_settings->has_enabled_tlsv1( ) ) ? options : options | asio::ssl::context::no_tlsv1;
                 options = ( m_ssl_settings->has_enabled_sslv2( ) ) ? options : options | asio::ssl::context::no_sslv2;
@@ -215,33 +262,36 @@ namespace restbed
                 options = ( m_ssl_settings->has_enabled_default_workarounds( ) ) ? options | asio::ssl::context::default_workarounds : options;
                 options = ( m_ssl_settings->has_enabled_single_diffie_hellman_use( ) ) ? options | asio::ssl::context::single_dh_use : options;
                 m_ssl_context->set_options( options );
-                
+
                 if ( not m_ssl_settings->get_bind_address( ).empty( ) )
                 {
-                    const auto address = asio::ip::make_address( m_ssl_settings->get_bind_address( ) );
-                    m_ssl_acceptor = make_shared< tcp::acceptor >( *m_io_context, tcp::endpoint( address, m_ssl_settings->get_port( ) ) );
+                    const auto address = address::from_string( m_ssl_settings->get_bind_address( ) );  ## Deprecated API
+                    m_ssl_acceptor = make_shared< tcp::acceptor >( *m_io_service, tcp::endpoint( address, m_ssl_settings->get_port( ) ) );
                 }
                 else
                 {
-                    m_ssl_acceptor = make_shared< tcp::acceptor >( *m_io_context, tcp::endpoint( tcp::v6( ), m_ssl_settings->get_port( ) ) );
+                    m_ssl_acceptor = make_shared< tcp::acceptor >( *m_io_service, tcp::endpoint( tcp::v6( ), m_ssl_settings->get_port( ) ) );
                 }
-                
+
                 m_ssl_acceptor->set_option( socket_base::reuse_address( m_settings->get_reuse_address( ) ) );
                 m_ssl_acceptor->listen( m_settings->get_connection_limit( ) );
-                
+
                 https_listen( );
-                
+
                 const auto location = get_https_uri( )->to_string( );
-                log( Logger::INFO, std::format( "Service accepting HTTPS connections at '{}'.",  location ) );
+                log( Logger::INFO, String::format( "Service accepting HTTPS connections at '%s'.",  location.data( ) ) );
             }
         }
-        
+
         void ServiceImpl::https_listen( void ) const
         {
-            auto socket = make_shared< asio::ssl::stream< tcp::socket > >( *m_io_context, *m_ssl_context );
+            auto socket = make_shared< asio::ssl::stream< tcp::socket > >( *m_io_service, *m_ssl_context );
             m_ssl_acceptor->async_accept( socket->lowest_layer( ), bind( &ServiceImpl::create_ssl_session, this, socket, _1 ) );
         }
-        
+
+        ## Fork difference: SSL session creation goes through m_session_manager->create() callback
+        ## instead of upstream's direct start_session() helper. This duplicates session-wiring code
+        ## across HTTP, HTTPS, and IPC paths — a trade-off for pluggable session management.
         void ServiceImpl::create_ssl_session( const shared_ptr< asio::ssl::stream< tcp::socket > >& socket, const error_code& error ) const
         {
             if ( not error )
@@ -250,11 +300,34 @@ namespace restbed
                 {
                     if ( error )
                     {
-                        log( Logger::SECURITY, std::format( "Failed SSL handshake, '{}'.", error.message( ) ) );
+                        log( Logger::SECURITY, String::format( "Failed SSL handshake, '%s'.", error.message( ).data( ) ) );
                         return;
                     }
-                    
-                    start_session( make_shared< SocketImpl >( *m_io_context, socket, m_logger ) );
+
+                    auto connection = make_shared< SocketImpl >( *m_io_service, socket, m_logger );
+                    connection->set_timeout( m_settings->get_connection_timeout( ) );
+                    if (m_settings->get_keep_alive()) {
+                        connection->set_keep_alive( m_settings->get_keep_alive_start(),
+                            m_settings->get_keep_alive_interval(),
+                            m_settings->get_keep_alive_cnt());
+                    }
+
+                    ## Fork: session creation delegated to external manager
+                    ## Upstream does this inline in a single start_session() method
+                    m_session_manager->create( [ this, connection ]( const shared_ptr< Session > session )
+                    {
+                        session->m_pimpl->m_settings = m_settings;
+                        session->m_pimpl->m_manager = m_session_manager;  ## Fork: session holds ref to its manager
+                        session->m_pimpl->m_web_socket_manager = m_web_socket_manager;
+                        session->m_pimpl->m_error_handler = m_error_handler;
+                        session->m_pimpl->m_perf_handler = m_perf_handler;  ## Fork addition: perf callback wired per session
+                        session->m_pimpl->m_request = make_shared< Request >( );
+                        session->m_pimpl->m_request->m_pimpl->m_socket = connection;
+                        session->m_pimpl->m_request->m_pimpl->m_socket->m_error_handler = m_error_handler;
+                        session->m_pimpl->m_request->m_pimpl->m_buffer = make_shared< asio::streambuf >( );
+                        session->m_pimpl->m_keep_alive_callback = bind( &ServiceImpl::parse_request, this, _1, _2, _3 );
+                        session->m_pimpl->m_request->m_pimpl->m_socket->start_read( session->m_pimpl->m_request->m_pimpl->m_buffer, "\r\n\r\n", bind( &ServiceImpl::parse_request, this, _1, _2, session ) );
+                    } );
                 } );
             }
             else
@@ -263,39 +336,64 @@ namespace restbed
                 {
                     socket->lowest_layer( ).close( );
                 }
-                
-                log( Logger::WARNING, std::format( "Failed to create session, '{}'.", error.message( ) ) );
+
+                log( Logger::WARNING, String::format( "Failed to create session, '%s'.", error.message( ).data( ) ) );
             }
-            
+
             https_listen( );
         }
 #endif
-        
+
 #ifdef BUILD_IPC
         void ServiceImpl::ipc_start( void )
         {
             const string location = m_settings->get_ipc_path( );
             ::remove( location.data( ) );
-            
-            m_ipc_acceptor = make_shared< stream_protocol::acceptor >( *m_io_context, stream_protocol::endpoint( location ) );
+
+            m_ipc_acceptor = make_shared< stream_protocol::acceptor >( *m_io_service, stream_protocol::endpoint( location ) );
             m_ipc_acceptor->set_option( socket_base::reuse_address( m_settings->get_reuse_address( ) ) );
             m_ipc_acceptor->listen( m_settings->get_connection_limit( ) );
             ipc_listen( );
-            
-            log( Logger::INFO, std::format( "Service accepting HTTP connections at '{}'.",  location ) );
+
+            log( Logger::INFO, String::format( "Service accepting HTTP connections at '%s'.",  location.data( ) ) );
         }
-        
+
         void ServiceImpl::ipc_listen( void ) const
         {
-            auto socket = make_shared< stream_protocol::socket >( *m_io_context );
+            auto socket = make_shared< stream_protocol::socket >( *m_io_service );
             m_ipc_acceptor->async_accept( *socket, bind( &ServiceImpl::create_ipc_session, this, socket, _1 ) );
         }
-        
+
+        ## Fork difference: uses IPCSocketImpl (dedicated class) instead of upstream's SocketImpl
+        ## with an IPC path parameter. Allows IPC-specific behavior (no TCP keep-alive semantics,
+        ## potential SO_PEERCRED support) without branching inside the main socket class.
         void ServiceImpl::create_ipc_session( const shared_ptr< stream_protocol::socket >& socket, const error_code& error ) const
         {
             if ( not error )
             {
-                start_session( make_shared< SocketImpl >( *m_io_context, socket, m_settings->get_ipc_path( ), m_logger ) );
+                auto connection = make_shared< IPCSocketImpl >( *m_io_service, socket, m_settings->get_ipc_path( ), m_logger );  ## IPCSocketImpl vs SocketImpl
+                connection->set_timeout( m_settings->get_connection_timeout( ) );
+                if (m_settings->get_keep_alive()) {
+                    connection->set_keep_alive( m_settings->get_keep_alive_start(),
+                        m_settings->get_keep_alive_interval(),
+                        m_settings->get_keep_alive_cnt());
+                }
+
+                ## Fork: same session-manager pattern as HTTP and SSL paths — duplicated wiring block
+                m_session_manager->create( [ this, connection ]( const shared_ptr< Session > session )
+                {
+                    session->m_pimpl->m_settings = m_settings;
+                    session->m_pimpl->m_manager = m_session_manager;
+                    session->m_pimpl->m_web_socket_manager = m_web_socket_manager;
+                    session->m_pimpl->m_error_handler = m_error_handler;
+                    session->m_pimpl->m_perf_handler = m_perf_handler;
+                    session->m_pimpl->m_request = make_shared< Request >( );
+                    session->m_pimpl->m_request->m_pimpl->m_socket = connection;
+                    session->m_pimpl->m_request->m_pimpl->m_socket->m_error_handler = m_error_handler;
+                    session->m_pimpl->m_request->m_pimpl->m_buffer = make_shared< asio::streambuf >( );
+                    session->m_pimpl->m_keep_alive_callback = bind( &ServiceImpl::parse_request, this, _1, _2, _3 );
+                    session->m_pimpl->m_request->m_pimpl->m_socket->start_read( session->m_pimpl->m_request->m_pimpl->m_buffer, "\r\n\r\n", bind( &ServiceImpl::parse_request, this, _1, _2, session ) );
+                } );
             }
             else
             {
@@ -303,34 +401,34 @@ namespace restbed
                 {
                     socket->close( );
                 }
-                
-                log( Logger::WARNING, std::format( "Failed to create session, '{}'.", error.message( ) ) );
+
+                log( Logger::WARNING, String::format( "Failed to create session, '%s'.", error.message( ).data( ) ) );
             }
-            
+
             ipc_listen( );
         }
 #endif
-        
+
         string ServiceImpl::sanitise_path( const string& path ) const
         {
             if ( path == "/" )
             {
                 return path;
             }
-            
-            smatch matches;
+
+            std::cmatch matches;                ## Fork uses cmatch + c_str() — upstream uses smatch directly
             string sanitised_path = "";
-            static const regex pattern( "^\\{[a-zA-Z0-9_\\-]+: ?(.*)\\}$" );
-            
-            for ( const auto& folder : String::split( path, '/' ) )
+            static const regex pattern( "^\\{[a-zA-Z0-9_\\-]+: ?(.*)\\}$", std::regex_constants::optimize );  ## optimize flag: hint to spend more compile time for faster matching (often ignored by implementations)
+
+            for ( auto folder : String::split( path, '/' ) )   ## Non-const copy — upstream uses const auto&
             {
                 if ( folder.front( ) == '{' and folder.back( ) == '}' )
                 {
-                    if ( not regex_match( folder, matches, pattern ) or matches.size( ) not_eq 2 )
+                    if ( not regex_match( folder.c_str(), matches, pattern ) or matches.size( ) not_eq 2 )
                     {
-                        throw runtime_error( std::format( "Resource path parameter declaration is malformed '{}'.", folder ) );
+                        throw runtime_error( String::format( "Resource path parameter declaration is malformed '%s'.", folder.data( ) ) );
                     }
-                    
+
                     sanitised_path += '/' + matches[ 1 ].str( );
                 }
                 else
@@ -338,49 +436,54 @@ namespace restbed
                     sanitised_path += '/' + folder;
                 }
             }
-            
-            if ( not path.empty( ) and path.back( ) == '/' )
+
+            ## BUG: no empty-path guard before path.back() — upstream adds: not path.empty() and path.back() == '/'
+            if ( path.back( ) == '/' )
             {
                 sanitised_path += '/';
             }
-            
+
             return sanitised_path;
         }
-        
+
+        ## Fork difference: only logs when no custom handler is set
+        ## Upstream always logs before dispatching (ensures 404s are recorded even if the handler swallows them)
         void ServiceImpl::not_found( const shared_ptr< Session > session ) const
         {
-            log( Logger::INFO, std::format( "'{}' resource route not found '{}'.",
-                                            session->get_origin( ),
-                                            session->get_request( )->get_path( ) ) );
-                                            
             if ( m_not_found_handler not_eq nullptr )
             {
                 m_not_found_handler( session );
             }
             else
             {
+                log( Logger::INFO, String::format( "'%s' resource route not found '%s'.",
+                                                session->get_origin( ).data( ),
+                                                session->get_request( )->get_path( ).data( ) ) );
                 session->close( NOT_FOUND );
             }
         }
-        
+
+        ## Fork difference: checks raw path against m_resource_routes
+        ## Upstream checks sanitise_path(path) — the raw check can miss collisions
+        ## when two paths differ only in their parameter regex patterns
         bool ServiceImpl::has_unique_paths( const set< string >& paths ) const
         {
             if ( paths.empty( ) )
             {
                 return false;
             }
-            
+
             for ( const auto& path : paths )
             {
-                if ( m_resource_routes.count( sanitise_path( path ) ) )
+                if ( m_resource_routes.count( path ) )  ## Should be sanitise_path(path) to match how routes are stored
                 {
                     return false;
                 }
             }
-            
+
             return true;
         }
-        
+
         void ServiceImpl::log( const Logger::Level level, const string& message ) const
         {
             if ( m_logger not_eq nullptr )
@@ -395,14 +498,14 @@ namespace restbed
                 }
             }
         }
-        
+
         void ServiceImpl::method_not_allowed( const shared_ptr< Session > session ) const
         {
-            log( Logger::INFO, std::format( "'{}' '{}' method not allowed '{}'.",
-                                            session->get_origin( ),
-                                            session->get_request( )->get_method( ),
-                                            session->get_request( )->get_path( ) ) );
-                                            
+            log( Logger::INFO, String::format( "'%s' '%s' method not allowed '%s'.",
+                                               session->get_origin( ).data( ),
+                                               session->get_request( )->get_method( ).data( ),
+                                               session->get_request( )->get_path( ).data( ) ) );
+
             if ( m_method_not_allowed_handler not_eq nullptr )
             {
                 m_method_not_allowed_handler( session );
@@ -412,14 +515,14 @@ namespace restbed
                 session->close( METHOD_NOT_ALLOWED );
             }
         }
-        
+
         void ServiceImpl::method_not_implemented( const shared_ptr< Session > session ) const
         {
-            log( Logger::INFO, std::format( "'{}' '{}' method not implemented '{}'.",
-                                            session->get_origin( ),
-                                            session->get_request( )->get_method( ),
-                                            session->get_request( )->get_path( ) ) );
-                                            
+            log( Logger::INFO, String::format( "'%s' '%s' method not implemented '%s'.",
+                                               session->get_origin( ).data( ),
+                                               session->get_request( )->get_method( ).data( ),
+                                               session->get_request( )->get_path( ).data( ) ) );
+
             if ( m_method_not_implemented_handler not_eq nullptr )
             {
                 m_method_not_implemented_handler( session );
@@ -429,94 +532,123 @@ namespace restbed
                 session->close( NOT_IMPLEMENTED );
             }
         }
-        
+
+        ## Fork addition: header filter validation handler
+        ## Called when all method handlers for a matched resource fail their header-filter checks.
+        ## Default response is 400 Bad Request with Connection: close to prevent the client
+        ## from pipelining more requests the server can't route.
+        void ServiceImpl::failed_filter_validation( const shared_ptr< Session > session ) const
+        {
+            log( Logger::INFO, String::format( "'%s' failed filter validation '%s'.",
+                                               session->get_origin( ).data( ),
+                                               session->get_request( )->get_path( ).data( ) ) );
+
+            if ( m_failed_filter_validation_handler not_eq nullptr )
+            {
+                m_failed_filter_validation_handler( session );
+            }
+            else
+            {
+                session->close( BAD_REQUEST, { { "Connection", "close" } } );
+            }
+        }
+
+        ## Fork difference: router is wrapped in rule_engine() at two levels:
+        ## 1) Service-level rules (m_rules) run before route matching — for cross-cutting concerns
+        ## 2) Resource-level rules (resource->m_pimpl->m_rules) run after route match, before method dispatch
+        ## Upstream has no rule engine — routing and dispatch run directly.
         void ServiceImpl::router( const shared_ptr< Session > session ) const
         {
-            log( Logger::INFO, std::format( "Incoming '{}' request from '{}' for route '{}'.",
-                                            session->get_request( )->get_method( ),
-                                            session->get_origin( ),
-                                            session->get_request( )->get_path( ) ) );
-                                            
             if ( session->is_closed( ) )
             {
                 return;
             }
-            
-            const auto resource_route = find_if( m_resource_routes.begin( ), m_resource_routes.end( ), bind( &ServiceImpl::resource_router, this, session, _1 ) );
-            
-            if ( resource_route == m_resource_routes.end( ) )
+
+            ## Service-level rule engine — runs before any route matching
+            rule_engine( session, m_rules, [ this ]( const shared_ptr< Session > session )
             {
-                return not_found( session );
-            }
-            
-            const auto path = resource_route->first;
-            session->m_pimpl->m_resource = resource_route->second;
-            const auto request = session->get_request( );
-            extract_path_parameters( path, request );
-            
-            const auto callback = [ this ]( const shared_ptr< Session > session )
-            {
-                if ( session->is_closed( ) )
+                const auto resource_route = find_if( m_resource_routes.begin( ), m_resource_routes.end( ), bind( &ServiceImpl::resource_router, this, session, _1 ) );
+
+                if ( resource_route == m_resource_routes.end( ) )
                 {
-                    return;
+                    return not_found( session );
                 }
-                
+
+                const auto path = resource_route->first;
+                session->m_pimpl->m_resource = resource_route->second;
                 const auto request = session->get_request( );
-                auto method_handler = find_method_handler( session );
-                
-                if ( method_handler == nullptr )
+                extract_path_parameters( path, request );
+
+                const auto callback = [ this ]( const shared_ptr< Session > session )
                 {
-                    if ( m_supported_methods.count( request->get_method( ) ) == 0 )
+                    ## Resource-level rule engine — runs after route match, before method dispatch
+                    rule_engine( session, session->m_pimpl->m_resource->m_pimpl->m_rules, [ this ]( const shared_ptr< Session > session )
                     {
-                        method_handler = bind( &ServiceImpl::method_not_implemented, this, _1 );
-                    }
-                    else
-                    {
-                        method_handler = bind( &ServiceImpl::method_not_allowed, this, _1 );
-                    }
+                        if ( session->is_closed( ) )
+                        {
+                            return;
+                        }
+
+                        const auto request = session->get_request( );
+                        auto method_handler = find_method_handler( session );
+
+                        if ( method_handler == nullptr )
+                        {
+                            if ( m_supported_methods.count( request->get_method( ) ) == 0 )
+                            {
+                                method_handler = bind( &ServiceImpl::method_not_implemented, this, _1 );
+                            }
+                            else
+                            {
+                                method_handler = bind( &ServiceImpl::method_not_allowed, this, _1 );
+                            }
+                        }
+
+                        method_handler( session );
+                    } );
+                };
+
+                if ( session->m_pimpl->m_resource->m_pimpl->m_authentication_handler not_eq nullptr )
+                {
+                    session->m_pimpl->m_resource->m_pimpl->m_authentication_handler( session, callback );
                 }
-                
-                method_handler( session );
-            };
-            
-            if ( session->m_pimpl->m_resource->m_pimpl->m_authentication_handler not_eq nullptr )
-            {
-                session->m_pimpl->m_resource->m_pimpl->m_authentication_handler( session, callback );
-            }
-            else
-            {
-                callback( session );
-            }
+                else
+                {
+                    callback( session );
+                }
+            } );
         }
-        
-        void ServiceImpl::start_session( const shared_ptr< SocketImpl >& connection ) const
-        {
-            connection->set_timeout( m_settings->get_connection_timeout( ) );
-            
-            if ( m_settings->get_keep_alive() )
-            {
-                connection->set_keep_alive( m_settings->get_keep_alive_start(),
-                                            m_settings->get_keep_alive_interval(),
-                                            m_settings->get_keep_alive_cnt() );
-            }
-            
-            auto session = make_shared< Session >( );
-            session->m_pimpl->m_settings = m_settings;
-            session->m_pimpl->m_web_socket_manager = m_web_socket_manager;
-            session->m_pimpl->m_error_handler = m_error_handler;
-            session->m_pimpl->m_request = make_shared< Request >( );
-            session->m_pimpl->m_request->m_pimpl->m_socket = connection;
-            session->m_pimpl->m_request->m_pimpl->m_socket->m_error_handler = m_error_handler;
-            session->m_pimpl->m_request->m_pimpl->m_buffer = make_shared< asio::streambuf >( );
-            session->m_pimpl->m_keep_alive_callback = bind( &ServiceImpl::parse_request, this, _1, _2, _3 );
-            session->m_pimpl->m_request->m_pimpl->m_socket->start_read( session->m_pimpl->m_request->m_pimpl->m_buffer, "\r\n\r\n", bind( &ServiceImpl::parse_request, this, _1, _2, session ) );
-        }
-        
+
+        ## Fork difference: session creation goes through m_session_manager->create() callback
+        ## and duplicates the full wiring block here. Upstream centralizes this in start_session().
+        ## Also tracks m_bytes_sent (fork addition for perf tracking).
         void ServiceImpl::create_session( const shared_ptr< tcp::socket >& socket, const error_code& error ) const
         {
             if ( not error )
             {
-                start_session( make_shared< SocketImpl >( *m_io_context, socket, m_logger ) );
+                auto connection = make_shared< SocketImpl >( *m_io_service, socket, m_logger );
+                connection->set_timeout( m_settings->get_connection_timeout( ) );
+                if (m_settings->get_keep_alive()) {
+                    connection->set_keep_alive( m_settings->get_keep_alive_start(),
+                        m_settings->get_keep_alive_interval(),
+                        m_settings->get_keep_alive_cnt());
+                }
+
+                m_session_manager->create( [ this, connection ]( const shared_ptr< Session > session )
+                {
+                    session->m_pimpl->m_settings = m_settings;
+                    session->m_pimpl->m_manager = m_session_manager;
+                    session->m_pimpl->m_web_socket_manager = m_web_socket_manager;
+                    session->m_pimpl->m_error_handler = m_error_handler;
+                    session->m_pimpl->m_perf_handler = m_perf_handler;      ## Fork addition: perf handler
+                    session->m_pimpl->m_request = make_shared< Request >( );
+                    session->m_pimpl->m_request->m_pimpl->m_socket = connection;
+                    session->m_pimpl->m_request->m_pimpl->m_socket->m_error_handler = m_error_handler;
+                    session->m_pimpl->m_request->m_pimpl->m_buffer = make_shared< asio::streambuf >( );
+                    session->m_pimpl->m_keep_alive_callback = bind( &ServiceImpl::parse_request, this, _1, _2, _3 );
+                    session->m_pimpl->m_request->m_pimpl->m_socket->start_read( session->m_pimpl->m_request->m_pimpl->m_buffer, "\r\n\r\n", bind( &ServiceImpl::parse_request, this, _1, _2, session ) );
+                    session->m_pimpl->m_bytes_sent = 0;                     ## Fork addition: byte counter for perf tracking
+                } );
             }
             else
             {
@@ -524,80 +656,112 @@ namespace restbed
                 {
                     socket->close( );
                 }
-                
-                log( Logger::WARNING, std::format( "Failed to create session, '{}'.", error.message( ) ) );
+
+                log( Logger::WARNING, String::format( "Failed to create session, '%s'.", error.message( ).data( ) ) );
             }
-            
+
             http_listen( );
         }
-        
+
         void ServiceImpl::extract_path_parameters( const string& sanitised_path, const shared_ptr< const Request >& request ) const
         {
-            smatch matches;
-            static const regex pattern( "^\\{([a-zA-Z0-9_\\-]+): ?.*\\}$" );
-            
+            std::cmatch matches;    ## cmatch + c_str() pattern — upstream uses smatch directly
+            static const regex pattern( "^\\{([a-zA-Z0-9_\\-]+): ?.*\\}$", std::regex_constants::optimize );
+
             const auto folders = String::split( request->get_path( ), '/' );
             const auto declarations = String::split( m_settings->get_root( ) + "/" + m_resource_paths.at( sanitised_path ), '/' );
-            
+
             // Clear previous parameters in case of "keep-alive" request
             request->m_pimpl->m_path_parameters.clear();
-            
+
             for ( size_t index = 0; index < folders.size( ) and index < declarations.size( ); index++ )
             {
                 const auto declaration = declarations[ index ];
-                
+
                 if ( declaration.front( ) == '{' and declaration.back( ) == '}' )
                 {
-                    regex_match( declaration, matches, pattern );
+                    regex_match( declaration.c_str(), matches, pattern );
                     request->m_pimpl->m_path_parameters.insert( make_pair( matches[ 1 ].str( ), folders[ index ] ) );
                 }
             }
         }
-        
+
+        ## Fork difference: find_method_handler includes header-filter validation
+        ## Upstream just does equal_range on the method name and returns the first match.
+        ## Fork's version: handler->second is a pair<filter_map, handler_function>.
+        ## For each candidate, it checks every filter (header name → regex pattern) against
+        ## the request's actual headers. Enables content negotiation and API versioning via
+        ## Accept, X-Api-Version, etc. Compounds the per-request regex cost.
         function< void ( const shared_ptr< Session > ) > ServiceImpl::find_method_handler( const shared_ptr< Session > session ) const
         {
             const auto request = session->get_request( );
             const auto resource = session->get_resource( );
             const auto method_handlers = resource->m_pimpl->m_method_handlers.equal_range( request->get_method( ) );
-            
+
+            bool failed_filter_validation = false;
             function< void ( const shared_ptr< Session > ) > method_handler = nullptr;
-            
+
             for ( auto handler = method_handlers.first; handler not_eq method_handlers.second and method_handler == nullptr; handler++ )
             {
-                method_handler = handler->second;
+                method_handler = handler->second.second;  ## .second.second = the handler function (.second.first = filter map)
+
+                ## Fork addition: header filter loop — each handler has a map of required header patterns
+                for ( const auto& filter : handler->second.first )
+                {
+                    for ( const auto& header : request->get_headers( filter.first ) )
+                    {
+                        if ( not regex_match( header.second, regex( filter.second ) ) )  ## Per-header regex compilation — performance concern
+                        {
+                            method_handler = nullptr;
+                            failed_filter_validation = true;
+                        }
+                    }
+                }
             }
-            
+
+            ## Fork addition: if filters rejected all handlers, dispatch to the filter-validation handler
+            if ( failed_filter_validation and method_handler == nullptr )
+            {
+                const auto handler = resource->m_pimpl->m_failed_filter_validation_handler;
+                method_handler = ( handler == nullptr ) ? bind( &ServiceImpl::failed_filter_validation, this, _1 ) : handler;
+            }
+
             return method_handler;
         }
-        
+
+        ## Fork difference: authenticate() interposes m_session_manager->load() between
+        ## authentication and routing. This hydrates server-side session state so that
+        ## the router and handlers can access session data. Upstream goes straight to router().
         void ServiceImpl::authenticate( const shared_ptr< Session > session ) const
         {
             if ( m_authentication_handler not_eq nullptr )
             {
                 m_authentication_handler( session, [ this ]( const shared_ptr< Session > session )
                 {
-                    this->router( session );
+                    m_session_manager->load( session, bind( &ServiceImpl::router, this, _1 ) );  ## Session hydration before routing
                 } );
             }
             else
             {
-                this->router( session );
+                m_session_manager->load( session, bind( &ServiceImpl::router, this, _1 ) );
             }
         }
-        
+
+        ## Same as upstream — per-request regex compilation per path segment per route.
+        ## Performance concern shared by both versions.
         bool ServiceImpl::resource_router( const shared_ptr< Session > session, const pair< string, shared_ptr< const Resource > >& route ) const
         {
             const auto request = session->get_request( );
             const auto path_folders = String::split( request->get_path( ), '/' );
             const auto route_folders = String::split( m_settings->get_root( ) + "/" + route.first, '/' );
-            
+
             if ( path_folders.empty( ) and route_folders.empty( ) )
             {
                 return true;
             }
-            
+
             bool match = false;
-            
+
             if ( path_folders.size( ) == route_folders.size( ) )
             {
                 for ( size_t index = 0; index < path_folders.size( ); index++ )
@@ -610,17 +774,17 @@ namespace restbed
                     {
                         match = regex_match( path_folders[ index ], regex( route_folders[ index ] ) );
                     }
-                    
+
                     if ( not match )
                     {
                         break;
                     }
                 }
             }
-            
+
             return match;
         }
-        
+
         void ServiceImpl::default_error_handler( const int status, const exception& error, const shared_ptr< Session > session )
         {
             if ( session not_eq nullptr and session->is_open( ) )
@@ -629,11 +793,11 @@ namespace restbed
                 session->close( status, body, { { "Content-Type", "text/plain" }, { "Content-Length", ::to_string( body.length( ) ) } } );
             }
         }
-        
+
         void ServiceImpl::discard_request( istream& stream )
         {
-            string line = "";
-            
+            string line = String::empty;    ## Uses custom String::empty constant — upstream uses ""
+
             while ( getline( stream, line ) )
             {
                 if ( line == "\r" )
@@ -642,22 +806,24 @@ namespace restbed
                 }
             }
         }
-        
+
+        ## Fork uses cmatch + optimize flag; upstream uses smatch without optimize.
+        ## Error message includes "That's all we know." — a Google-style easter egg the upstream dropped.
         const map< string, string > ServiceImpl::parse_request_line( istream& stream )
         {
-            smatch matches;
-            static const regex pattern( "^([0-9a-zA-Z]*) ([a-zA-Z0-9:@_~!,;=#%&'\\-\\.\\/\\?\\$\\(\\)\\*\\+]+) (HTTP\\/[0-9]\\.[0-9])\\s*$" );
+            std::cmatch matches;
+            static const regex pattern( "^([0-9a-zA-Z]*) ([a-zA-Z0-9:@_~!,;=#%&'\\-\\.\\/\\?\\$\\(\\)\\*\\+]+) (HTTP\\/[0-9]\\.[0-9])\\s*$", std::regex_constants::optimize );
             string data = "";
             getline( stream, data );
-            
-            if ( not regex_match( data, matches, pattern ) or matches.size( ) not_eq 4 )
+
+            if ( not regex_match( data.c_str(), matches, pattern ) or matches.size( ) not_eq 4 )
             {
-                throw runtime_error( "Your client has issued a malformed or illegal request status line." );
+                throw runtime_error( "Your client has issued a malformed or illegal request status line. That's all we know." );
             }
-            
+
             const string protocol = matches[ 3 ].str( );
             const auto delimiter = protocol.find_first_of( "/" );
-            
+
             return map< string, string >
             {
                 { "path", matches[ 2 ].str( ) },
@@ -666,69 +832,99 @@ namespace restbed
                 { "protocol", protocol.substr( 0, delimiter ) }
             };
         }
-        
-        double ServiceImpl::parse_http_version( const string& value )
-        {
-            double version = 0.0;
-            const char* const first = value.data( );
-            const char* const last = first + value.size( );
-            const auto result = std::from_chars( first, last, version );
-            
-            if ( result.ec not_eq std::errc( ) or result.ptr not_eq last )
-            {
-                throw runtime_error( "Your client has issued a malformed or illegal request status line." );
-            }
-            
-            return version;
+
+        ## Fork addition: manual whitespace trimming for header parsing
+        ## Sourced from Stack Overflow (per inline comment). Replaces upstream's regex-based
+        ## header parser. Avoids std::regex overhead on every header line — a practical
+        ## performance win, but these deserve a proper utility home rather than an inline paste.
+
+        // trim code ripped from stackoverflow https://stackoverflow.com/questions/216823/whats-the-best-way-to-trim-stdstring
+        // trip from start (in place)
+        static inline void ltrim(std::string &s) {
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+                return !std::isspace(ch);
+            }));
         }
-        
+
+        // trim from end (in place)
+        static inline void rtrim(std::string &s) {
+            s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+                return !std::isspace(ch);
+            }).base(), s.end());
+        }
+
+        // trim from both ends (in place)
+        static std::string trim(std::string &s) {
+            auto ret = s;
+            ltrim(ret);
+            rtrim(ret);
+            return ret;
+        }
+
+        ## Fork difference: manual header parsing (find colon, substr, trim) instead of
+        ## upstream's regex (^([^:]*): *(.*?)\s*$). Faster per header, especially under
+        ## high request volume with many headers. Same error message with "That's all we know."
         const multimap< string, string > ServiceImpl::parse_request_headers( istream& stream )
         {
-            smatch matches;
             string data = "";
             multimap< string, string > headers;
-            static const regex pattern( "^([^:]*): *(.*?)\\s*$" );
-            
             while ( getline( stream, data ) and data not_eq "\r" )
             {
-                if ( not regex_match( data, matches, pattern ) or matches.size( ) not_eq 3 )
-                {
-                    throw runtime_error( "Your client has issued a malformed or illegal request header." );
+                const auto colonOffset = data.find(':');
+                if (colonOffset == std::string::npos) {
+                    throw runtime_error( "Your client has issued a malformed or illegal request header. That's all we know." );
                 }
-                
-                headers.insert( make_pair( matches[ 1 ].str( ), matches[ 2 ].str( ) ) );
+                else {
+                    std::string name = data.substr(0, colonOffset);
+                    std::string value = data.substr(colonOffset + 1);
+                    headers.insert( make_pair( trim(name), trim(value) ) );
+                }
             }
-            
+
             return headers;
         }
-        
+
+        ## Fork difference vs upstream in parse_request:
+        ## 1) No m_resource/m_error_handler_invoked reset — upstream resets these to prevent
+        ##    stale state leaking across keep-alive requests (potential bug in fork)
+        ## 2) Uses stod() with setlocale hack for HTTP version — thread-unsafe (see below)
+        ## 3) Captures m_start_time and resets m_bytes_sent for perf tracking (fork addition)
         void ServiceImpl::parse_request( const error_code& error, size_t, const shared_ptr< Session > session ) const
         {
-            session->m_pimpl->m_resource = nullptr;
-            session->m_pimpl->m_error_handler_invoked = false;
-            
             istream stream( session->m_pimpl->m_request->m_pimpl->m_buffer.get( ) );
-            
+
             if ( error )
             {
                 discard_request( stream );
                 const auto error_handler = get_error_handler( session );
                 return error_handler( 400, runtime_error( error.message( ) ), session );
             }
-            
+
             try
             {
                 const auto items = parse_request_line( stream );
                 const auto uri = Uri::parse( "http://localhost" + items.at( "path" ) );
-                
+
                 session->m_pimpl->m_request->m_pimpl->m_body.clear( );
                 session->m_pimpl->m_request->m_pimpl->m_path = Uri::decode( uri.get_path( ) );
                 session->m_pimpl->m_request->m_pimpl->m_method = items.at( "method" );
                 session->m_pimpl->m_request->m_pimpl->m_headers = parse_request_headers( stream );
                 session->m_pimpl->m_request->m_pimpl->m_query_parameters = uri.get_query_parameters( );
-                
-                session->m_pimpl->m_request->m_pimpl->m_version = parse_http_version( items.at( "version" ) );
-                
+                session->m_pimpl->m_start_time = std::chrono::steady_clock::now();  ## Fork addition: request start time for perf measurement
+                session->m_pimpl->m_bytes_sent = 0;                                 ## Fork addition: reset byte counter per request
+
+                ## BUG: Thread-unsafe locale manipulation.
+                ## stod() uses the current C locale to parse decimals. In a French/German locale,
+                ## "1.1" fails because the locale expects "1,1". This hack saves/restores the locale,
+                ## but setlocale() is global state — two threads parsing concurrently will corrupt
+                ## each other's locale. Upstream replaced this with std::from_chars (locale-independent,
+                ## thread-safe). This is a real concurrency bug under load.
+                char* locale = strdup( setlocale( LC_NUMERIC, nullptr ) );
+                setlocale( LC_NUMERIC, "C" );
+                session->m_pimpl->m_request->m_pimpl->m_version = stod( items.at( "version" ) );
+                setlocale( LC_NUMERIC, locale );
+                free( locale );
+
                 authenticate( session );
             }
             catch ( const int status_code )
@@ -759,7 +955,7 @@ namespace restbed
             {
                 discard_request( stream );
                 auto cex = current_exception( );
-                
+
                 if ( cex not_eq nullptr )
                 {
                     try
@@ -784,58 +980,59 @@ namespace restbed
                 }
             }
         }
-        
+
+        ## Uses String::format (sprintf-style) and String::empty — upstream uses std::format and ""
         const shared_ptr< const Uri > ServiceImpl::get_http_uri( void ) const
         {
             if ( m_acceptor == nullptr )
             {
                 return nullptr;
             }
-            
+
             auto endpoint = m_acceptor->local_endpoint( );
             auto address = endpoint.address( );
-            string uri = "";
-            
+            auto uri = String::empty;
+
             if ( address.is_v6( ) )
             {
-                uri = std::format( "http://[{}]:{}", address.to_string( ), endpoint.port( ) );
+                uri = String::format( "http://[%s]:%u", address.to_string( ).data( ), endpoint.port( ) );
             }
             else
             {
-                uri = std::format( "http://{}:{}", address.to_string( ), endpoint.port( ) );
+                uri = String::format( "http://%s:%u", address.to_string( ).data( ), endpoint.port( ) );
             }
-            
+
             return make_shared< const Uri >( uri );
         }
-        
+
         const shared_ptr< const Uri > ServiceImpl::get_https_uri( void ) const
         {
 #ifdef BUILD_SSL
-        
+
             if ( m_ssl_acceptor == nullptr )
             {
                 return nullptr;
             }
-            
+
             auto endpoint = m_ssl_acceptor->local_endpoint( );
             auto address = endpoint.address( );
-            string uri = "";
-            
+            auto uri = String::empty;
+
             if ( address.is_v6( ) )
             {
-                uri = std::format( "https://[{}]:{}", address.to_string( ), endpoint.port( ) );
+                uri = String::format( "https://[%s]:%u", address.to_string( ).data( ), endpoint.port( ) );
             }
             else
             {
-                uri = std::format( "https://{}:{}", address.to_string( ), endpoint.port( ) );
+                uri = String::format( "https://%s:%u", address.to_string( ).data( ), endpoint.port( ) );
             }
-            
+
             return make_shared< const Uri >( uri );
 #else
-            throw runtime_error( "Not Implemented! Rebuild Restbed with SSL funcationality enabled." );
+            throw runtime_error( "Not Implemented! Rebuild Restbed with SSL funcationality enabled." );  ## Typo: "funcationality" — present in both versions
 #endif
         }
-        
+
         const function< void ( const int, const exception&, const shared_ptr< Session > ) > ServiceImpl::get_error_handler( const shared_ptr< Session >& session ) const
         {
             return ( session->m_pimpl->m_resource not_eq nullptr and session->m_pimpl->m_resource->m_pimpl->m_error_handler not_eq nullptr ) ? session->m_pimpl->m_resource->m_pimpl->m_error_handler : m_error_handler;
